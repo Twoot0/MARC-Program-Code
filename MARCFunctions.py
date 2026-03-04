@@ -70,7 +70,19 @@ def armOpen(state):
         )
         marc.wait(2)
 
-
+#LiDAR DEF
+#make sure uart1 = busio.UART(board.GP4, board.GP5, baudrate=115200)
+def scan()
+    if uart1.in_waiting >= 9:   # Check if full packet available
+        data = uart1.read(9)    # Read 9-byte TF-Luna packet
+        
+        if data is not None and len(data) == 9:
+            
+            # Check header bytes (0x59 0x59)
+            if data[0] == 0x59 and data[1] == 0x59:
+                
+                # Distance (cm)
+                distance = data[2] + (data[3] << 8)
 
 
 
