@@ -82,5 +82,5 @@ def scan():
                 # Distance (cm)
                 distance = data[2] + (data[3] << 8)
                 return distance
-
+    return None
 
