@@ -70,6 +70,22 @@ def armOpen(state):
         )
         marc.wait(2)
 
+#motor movement def
+
+def spin(spinFac):
+    #og was +-0.5
+    x = spinFac
+    marc.set_multiple_motor_throttles(
+        motor_throttles=[-x, x, 0],#Right, Left, Extra
+    )
+
+def forward(speedFac):
+    #og speedFac was 0.5
+    x = speedFac
+    marc.set_multiple_motor_throttles(
+        motor_throttles=[x, x, 0],#Right, Left, Extra
+    )
+
 #LiDAR DEF
 #make sure uart1 = busio.UART(board.GP4, board.GP5, baudrate=115200)
 def scan():
