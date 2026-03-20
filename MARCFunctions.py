@@ -5,6 +5,7 @@ import board
 import digitalio
 import supervisor
 import traceback
+import math
 
 
 # Python modules from the "lib" folder
@@ -66,11 +67,19 @@ def armOpen(state):
 #motor movement def
 
 def spin(spinFac):
-    #og was +-0.5
-    x = spinFac
+    # spinFac > 0 is CCW, spinFac < 0 is CW
+    if spinFac > 0:
+        # Counter-Clockwise: Right wheel is 1.2x stronger
+        r_speed = spinFac * 1.2
+        l_speed = spinFac
+    else:
+        # Clockwise (or stopped): Keep them equal
+        r_speed = spinFac
+        l_speed = spinFac
+        
     marc.set_multiple_motor_throttles(
-        motor_throttles=[x, x, 0],#Right, Left, Extra
-        #runtime = 1
+        motor_throttles=[r_speed, l_speed, 0], # Right, Left, Extra
+        runtime = 1
     )
 
 def forward(speedFac):
@@ -101,10 +110,10 @@ def scan():
                 if len(data) == 7:
                     distance = data[0] + (data[1] << 8)
                     # Reliability check: TF-Luna distance shouldn't be 0 or 65535
-                    if 0 < distance < 1200: 
+                    if 0 < distance < 1200:
                         return distance
             else:
-                # Byte 2 wasn't 0x59, so byte 1 wasn't a real header. 
+                # Byte 2 wasn't 0x59, so byte 1 wasn't a real header.
                 # The loop continues to look for the next 0x59.
                 continue
         else:
@@ -113,7 +122,7 @@ def scan():
     return None
 
 #Define different speeds (SpinFac) for different actions
-Initial_sweep_speed = 0.3
+Initial_sweep_speed = 0.8
 forward_drive_speed = 1
 
 #Define other tuning variables
@@ -150,7 +159,7 @@ def find_minimum_distance(smoothed_list):
     # Find the index where the distance was minimum (bottom of the U)
     min_dist = min(smoothed_list)
     mid_index = smoothed_list.index(min_dist)
-    
+
     return mid_index
 
 
@@ -161,7 +170,7 @@ Calculates the slope (gradient) of the distance over the last few samples.
 A negative value means distance is decreasing (moving toward can center).
 A positive value means distance is increasing (drifting off the can).
 
-Precondition: data_buffer, which is the number of most recent points to be used to calculate the derivative. 
+Precondition: data_buffer, which is the number of most recent points to be used to calculate the derivative.
 
 Postcondition: a float that indicates the linearized slope/trend
 """
@@ -170,19 +179,19 @@ def calculate_gradient(data_buffer):
     n = len(data_buffer)
     if n < 2:
         return 0
-    
+
     # We use the indices as 'x' and distances as 'y'
     sum_x = sum(range(n))
     sum_y = sum(data_buffer)
     sum_xx = sum(i * i for i in range(n))
     sum_xy = sum(i * data_buffer[i] for i in range(n))
-    
+
     # Standard linear regression slope formula:
     # slope = (n*sum_xy - sum_x*sum_y) / (n*sum_xx - sum_x**2)
     denominator = (n * sum_xx - sum_x**2)
     if denominator == 0:
         return 0
-        
+
     slope = (n * sum_xy - sum_x * sum_y) / denominator
     return slope
 
@@ -210,166 +219,241 @@ def update_buffer(new_reading):
 
 
 
-def initial_locate(sweep_duration=5.0):
-    print("Phase 1: Starting initial sweep...")
+def initial_locate(timeout=10.0):
+    print("Phase 1: Starting Gradient-Triggered Sweep...")
     raw_scan_data = []
+    log_timestamps = []
     
-    # 1. Sweep and Record
+    can_detected = False
+    can_passed = False
+    extra_scan_start = None
+    
+    # We'll use a small local window to check the exit gradient
+    exit_buffer = []
+    EXIT_WINDOW = 4 
+    # A positive gradient of > 10cm/sample usually means we've hit the background
+    EXIT_GRADIENT_THRESHOLD = 10.0 
+
+    uart1.reset_input_buffer()
     start_time = time.monotonic()
-    spin(Initial_sweep_speed)
     
-    while (time.monotonic() - start_time) < sweep_duration:
+    # Start spinning
+    marc.set_multiple_motor_throttles([1.2*Initial_sweep_speed, Initial_sweep_speed, 0], runtime = 1)
+    
+    while (time.monotonic() - start_time) < timeout:
         d = scan()
         if d is not None:
+            curr_time = time.monotonic() - start_time
             raw_scan_data.append(d)
-        time.sleep(0.01) # Small delay to prevent CPU hogging
+            log_timestamps.append(curr_time)
+            
+            # Update local exit buffer
+            exit_buffer.append(d)
+            if len(exit_buffer) > EXIT_WINDOW:
+                exit_buffer.pop(0)
+
+            # 1. Detect entry (Simple drop in distance)
+            if not can_detected and len(raw_scan_data) > 2:
+                # If distance drops by more than 50cm suddenly, we found 'something'
+                if (raw_scan_data[-2] - d) > 50: 
+                    print(f"Target Entered View: {d}cm")
+                    can_detected = True
+
+            # 2. Detect exit (Gradient Analysis)
+            if can_detected and not can_passed and len(exit_buffer) == EXIT_WINDOW:
+                current_grad = calculate_gradient(exit_buffer)
+                if current_grad > EXIT_GRADIENT_THRESHOLD:
+                    print(f"Target Exit Detected (Grad: {current_grad:.1f}). Finishing scan...")
+                    can_passed = True
+                    extra_scan_start = time.monotonic()
+        
+        # 3. The 1-second "Padding"
+        if can_passed and (time.monotonic() - extra_scan_start) > 1.0:
+            break
+            
+        time.sleep(0.01)
+
+    spin(0) # Emergency stop
     
-    spin(0) # Stop spinning
-    
-    if not raw_scan_data:
-        print("Error: No LiDAR data collected.")
+    if not can_detected:
+        print("Error: Target never entered field of view.")
         return False
 
-    # 2. Process Data
+    # --- Alignment Math ---
     smoothed = smooth_data(raw_scan_data)
     mid_index = find_minimum_distance(smoothed)
     
-    # 3. Calculate Reverse Spin
-    # The percentage of the sweep we need to go back
+    actual_duration = log_timestamps[-1]
     total_samples = len(raw_scan_data)
     samples_to_reverse = total_samples - mid_index
-    reverse_time = (samples_to_reverse / total_samples) * sweep_duration
+    reverse_time = (samples_to_reverse / total_samples) * actual_duration
     
-    print(f"Can found at index {mid_index}. Reversing for {reverse_time:.2f}s")
+    print(f"Alignment: Midpoint at index {mid_index}. Reversing {reverse_time:.2f}s")
     
-    # 4. Align to Center
-    spin(-Initial_sweep_speed) # Spin in opposite direction
+    marc.set_multiple_motor_throttles([-Initial_sweep_speed, -Initial_sweep_speed, 0], runtime = 1)
     time.sleep(reverse_time)
     spin(0)
     
-    print("Phase 1 Complete: Aligned with can.")
     return True
-    
-    
 
 
 # --- Fine-Tuned Constants ---
 base_gradient = -0.8369  # Your calibrated value (cm/sample)
 # MAX_PHYSICAL_DELTA: If distance increases by more than 4cm + your speed, it's a wall.
 # We set this lower because at 20Hz, the rover moves very little between samples.
-MAX_PHYSICAL_DELTA = 4.0 - base_gradient 
+MAX_PHYSICAL_DELTA = 4.0 - base_gradient
 
 BLIP_THRESHOLD = 30  # CM jump to ignore (sensor glitch)
 MAX_BLIPS = 15       # At 20Hz, 15 samples is only 0.75 seconds of "lost" data.
 
-# BUFFER_SIZE: Since you have 20Hz data, we can afford a larger buffer (10 samples) 
+# BUFFER_SIZE: Since you have 20Hz data, we can afford a larger buffer (10 samples)
 # to get a very smooth gradient without much delay (0.5 seconds of history).
-BUFFER_SIZE = 10 
+BUFFER_SIZE = 10
 
 # WOBBLE_FREQ: Adjusted for 20Hz sampling to keep the "wiggle" visible.
-WOBBLE_FREQ = 0.5    
+WOBBLE_FREQ = 0.5
 
 # CORRECTION_KP: How aggressively the rover turns back to center.
 CORRECTION_KP = 0.3
 
 
-def approach_optimized(stop_distance=15):
+def approach_optimized(stop_distance=22):
     global distance_history
-    distance_history = [] # Reset buffer
+    distance_history = [] 
     last_valid_dist = None
     blip_count = 0
     start_time = time.monotonic()
+    last_steering_dir = 0 
+    
+    # TUNING: Time to rotate 90 degrees at search speed (e.g., 0.8)
+    ninety_degree_time = 1.2 
 
     while True:
-        d = scan() # TF-Luna @ 3Hz
+        d = scan() 
         if d is None: continue
+        curr_time = time.monotonic() - start_time
 
-        # --- 1. GATING LOGIC (Blip Protection) ---
+        # --- 1. TARGET LOSS & RECOVERY ---
         if last_valid_dist is not None:
-            # If distance jumps up by more than BLIP_THRESHOLD, it's the wall
             if (d - last_valid_dist) > BLIP_THRESHOLD:
                 blip_count += 1
-                print(f"Blip detected! Count: {blip_count}")
-                
                 if blip_count > MAX_BLIPS:
-                    print("Target Lost: Stopping for safety.")
-                    marc.set_multiple_motor_throttles([0, 0, 0])
-                    return "LOST"  # Return a status code instead of breaking
-                
-                # IMPORTANT: We do NOT update the buffer with the blip.
-                # We skip the rest of this loop iteration to "hold" the last state.
-                time.sleep(0.3)
-                continue 
-        
-        # If we reach here, it's a valid reading
-        blip_count = 0 
+                    print("!!! Target Lost: Starting Recovery Sweeps !!!")
+                    # Try 90 deg one way, then 180 deg the other
+                    success = recovery_sweep(last_steering_dir, ninety_degree_time)
+                    
+                    if success:
+                        print("Re-acquired! Resuming approach...")
+                        blip_count = 0
+                        distance_history = [] 
+                        continue # Back to the top of the while loop
+                    else:
+                        print("Total Loss: Returning to Phase 1 (Full Sweep)")
+                        return "LOST" # This triggers the locate() loop to restart
+                continue
+
+        blip_count = 0
         last_valid_dist = d
 
-        # Stop condition
-        if d <= stop_distance: 
-            marc.set_multiple_motor_throttles([0, 0, 0])
-            print("Arrived at target!")
-            return "ARRIVED"  # Return a status code for success
-            
+        # --- 2. ARRIVAL & CONTROL (Same as before) ---
+        if d <= stop_distance:
+            marc.set_multiple_motor_throttles([0, 0, 0], runtime = 1)
+            return "ARRIVED"
+
+        current_speed = 0.7
+        if d < 30:
+            marc.set_multiple_motor_throttles([-current_speed, current_speed, 0], runtime = 1)
+            continue
+
         update_buffer(d)
-        
-        # --- 2. CONTROL LOGIC ---
         if len(distance_history) >= BUFFER_SIZE:
             elapsed = time.monotonic() - start_time
+            wiggle = math.sin(elapsed * WOBBLE_FREQ * 2 * math.pi) * (0.08 * (d / 100.0))
+            net_slope = calculate_gradient(distance_history) - base_gradient
+            bias = net_slope * CORRECTION_KP if abs(net_slope) > 0.05 else 0
             
-            # Sinusoidal Wiggle
-            # As d (distance) gets smaller, the wiggle amplitude gets smaller
-            dynamic_amplitude = 0.12 * (d / 60.0) # Full wiggle at 60cm, nearly 0 at 0cm
-            wiggle = math.sin(elapsed * WOBBLE_FREQ * 2 * math.pi) * dynamic_amplitude
-            
-            # Gradient Analysis
-            current_slope = calculate_gradient(distance_history)
-            net_slope = current_slope - base_gradient
-            
-            # Proportional Correction
-            bias = 0
-            if net_slope > 0.05: 
-                bias = net_slope * CORRECTION_KP
-            
-            # Motor Output
-            # Note: If bias is positive, it nudges the rover. 
-            # You may need to flip the +/- on bias depending on which motor needs to slow down.
-            marc.set_multiple_motor_throttles([
-                forward_drive_speed + wiggle + bias,
-                forward_drive_speed - wiggle - bias,
-                0
-            ])
+            last_steering_dir = wiggle + bias 
+            l_speed = current_speed - last_steering_dir
+            r_speed = -(current_speed + last_steering_dir) 
+            marc.set_multiple_motor_throttles([r_speed, l_speed, 0], runtime = 1)
         else:
-            # Not enough data yet, drive straight
-            marc.set_multiple_motor_throttles([forward_drive_speed, forward_drive_speed, 0])
-        
-        time.sleep(0.3)
+            marc.set_multiple_motor_throttles([-current_speed, current_speed, 0], runtime = 1)
 
+        time.sleep(0.05)
+
+def recovery_sweep(last_dir, ninety_time):
+    # Step 1: Rotate 90 degrees in the direction we were leaning
+    search_speed = 0.8 if last_dir > 0 else -0.8
+    print(f"Sweep 1: 90 degrees @ {search_speed}")
+    if scan_for_target(search_speed, ninety_time):
+        return True
+        
+    # Step 2: Rotate 180 degrees the OTHER way
+    print(f"Sweep 2: 180 degrees @ {-search_speed}")
+    # We use ninety_time * 2 to cover the full 180 degree arc
+    if scan_for_target(-search_speed, ninety_time * 2):
+        return True
+        
+    return False # If we reach here, both sweeps failed
+
+def scan_for_target(speed, duration):
+    """Spins and breaks immediately if the can is spotted."""
+    start_search = time.monotonic()
+    
+    # APPLY THE 1.2x BOOST HERE FOR RECOVERY
+    # If speed is positive, it's a CCW spin
+    if speed > 0:
+        r_motor = speed * 1.2
+        l_motor = speed
+    else:
+        r_motor = speed
+        l_motor = speed
+        
+    marc.set_multiple_motor_throttles([r_motor, l_motor, 0], runtime = 1) 
+    
+    while (time.monotonic() - start_search) < duration:
+        d = scan()
+        if d is not None and d < 100:
+            print(f"Found something at {d}cm! Stopping.")
+            marc.set_multiple_motor_throttles([0, 0, 0], runtime = 1)
+            return True
+        time.sleep(0.02)
+    
+    marc.set_multiple_motor_throttles([0, 0, 0], runtime = 1)
+    return False
+
+def dump_approach_log(log_data):
+    print("\n--- APPROACH DATA LOG ---")
+    print("Time (s) | Dist (cm) | Status/Bias")
+    print("-" * 35)
+    for entry in log_data:
+        print(f"{entry[0]:.2f}     | {entry[1]:.1f}      | {entry[2]}")
+    print("-" * 35)
 
 def locate():
     while True:
-        if not initial_locate(sweep_duration=5.0):
-            continue 
+        if not initial_locate(5.0):
+            continue
 
         print("Closing the gap...")
         target_found = True
         last_d = None
-        
+
         while True:
             d = scan()
             if d is None: continue
-            
+
             # --- ROBUST GATING ---
             if last_d is not None:
                 delta = d - last_d
-                
-                # Check 1: The "Impossible Leap" 
+
+                # Check 1: The "Impossible Leap"
                 # If d increases by more than we could have moved, we hit the wall
                 if delta > MAX_PHYSICAL_DELTA:
                     print(f"Target Lost (Jump: {delta:.1f}cm). Re-scanning...")
                     target_found = False
                     break
-                
+
                 # Check 2: The "Gradient Flip"
                 # If we are driving forward but distance is INCREASING, we lost the 'dip'
                 if delta > 2.0: # Small tolerance for sensor noise
@@ -379,21 +463,21 @@ def locate():
 
             last_d = d
 
-            if d <= 60: 
-                forward(0) 
+            if d <= 60:
+                forward(0)
                 break
-            
+
             forward(forward_drive_speed)
             time.sleep(0.1)
 
         if not target_found:
-            continue 
+            continue
 
         # Proceed to Phase 2
         status = approach_optimized(stop_distance=15)
-        
+
         if status == "ARRIVED":
-            break 
+            break
         elif status == "LOST":
             print("Approach failed. Restarting search...")
 
@@ -402,22 +486,22 @@ def calibrate_base_gradient(duration=3.0):
     print(f"Starting Calibration Sweep ({duration}s)...")
     readings = []
     timestamps = []
-    
+
     # 1. Clear the UART buffer to get fresh data immediately
     uart1.reset_input_buffer()
-    
+
     start_t = time.monotonic()
     forward(forward_drive_speed)
-    
+
     while (time.monotonic() - start_t) < duration:
         d = scan()
         if d is not None:
             readings.append(d)
             timestamps.append(time.monotonic() - start_t) # Relative time
-        time.sleep(0.05) 
-        
+        time.sleep(0.05)
+
     forward(0) # Stop
-    
+
     if not readings:
         print("No data collected. Check LiDAR wiring.")
         return None
@@ -432,12 +516,12 @@ def calibrate_base_gradient(duration=3.0):
     print("-" * 30)
     for i in range(len(readings)):
         print(f"{i:03d}   | {timestamps[i]:.2f}     | {readings[i]}")
-    
+
     print("-" * 30)
     print(f"Final Count: {len(readings)} samples")
     print(f"Actual HZ:   {hz:.2f} Hz")
     print(f"Base Grad:   {avg_grad:.4f} cm/sample")
-    
+
     return readings
 
 # To run it:
@@ -447,17 +531,17 @@ def driving_test():
     print("--- Rover Target Acquisition Test ---")
     print(f"Parameters: Base Speed: {forward_drive_speed}, Sweep Speed: {Initial_sweep_speed}")
     print(f"Base Gradient: {base_gradient}, Max Physical Delta: {MAX_PHYSICAL_DELTA}")
-    
+
     # Wait for user to place the rover and clear the area
     print("System ready. Starting in 3 seconds... (Press Ctrl+C to abort)")
     time.sleep(3)
-    
+
     try:
         # Start the State Machine
         locate()
-        
+
         print("\n[SUCCESS] Rover reached the stop distance.")
-        
+
     except KeyboardInterrupt:
         print("\n[ABORTED] User interrupted the test.")
     except Exception as e:
@@ -465,6 +549,6 @@ def driving_test():
     finally:
         # SAFETY FIRST: Always ensure motors are OFF when the script ends
         print("Safety Shutdown: Powering down motors.")
-        marc.set_multiple_motor_throttles([0, 0, 0])
+        marc.set_multiple_motor_throttles([0, 0, 0], runtime = 1)
 
 
