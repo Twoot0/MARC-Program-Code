@@ -238,36 +238,39 @@ WOBBLE_FREQ = 0.5
 CORRECTION_KP = 0.2
 
 # TUNING: Time to rotate 90 degrees at  search speed (e.g., 0.8)
-ninety_degree_time = 3
+ninety_degree_time = 4
+
+# --- TWEAKED CONSTANTS ---
+
+# 1. Increase this so small distance jumps don't stop the sweep early
+# 25.0 is much more "stubborn" and will keep the sweep going longer
+EXIT_GRADIENT_THRESHOLD = 25.0 
+
+# 2. Allow for a bit more padding (0.8s instead of 0.5s)
+# This ensures we get a full scan of the object before stopping
+EXIT_PADDING_TIME = 0.8 
 
 
-def initial_locate(timeout=ninety_degree_time):
-    print("Phase 1: Starting Multi-Directional Search with Can Validation...")
+def initial_locate(timeout=None):
+    if timeout is None:
+        timeout = ninety_degree_time # 4 seconds
+
+    # 1. Quick CW Sweep (Usually 4s or until padding)
+    print(f"Phase 1: Starting CW Search (Max: {timeout}s)")
+    found_cw, cw_data = scan_and_map(speed=-Initial_sweep_speed, timeout=timeout, low=20, high=150)
     
-    # 1. Try Clockwise Sweep (90 degrees)
-    found_cw, cw_data = scan_and_map(speed=-Initial_sweep_speed, timeout=timeout*1.5, low=20, high=150)
-    if found_cw:
-        # VALIDATION: Check if the object's physical width matches a can
-        if is_it_a_can(cw_data):
-            process_sweep_alignment(cw_data, Initial_sweep_speed)
-            return True
-        else:
-            print("CW Object rejected: Width does not match a can. Continuing search...")
+    if found_cw and is_it_a_can(cw_data):
+        process_sweep_alignment(cw_data, Initial_sweep_speed)
+        return True
 
-    print("Target not found CW (or rejected). Trying CCW...")
-
-    # 2. Try Counter-Clockwise Sweep (180 degrees+)
-    # We use a larger timeout here to ensure a full 360+ coverage if needed
+    # 2. Deep CCW Sweep (Max 20s, but will likely exit in ~6-8s if it finds the can)
+    print("Target not found CW. Trying CCW Full Sweep...")
     found_ccw, ccw_data = scan_and_map(speed=Initial_sweep_speed, timeout=timeout * 5, low=20, high=150)
-    if found_ccw:
-        # VALIDATION: Check if the object's physical width matches a can
-        if is_it_a_can(ccw_data):
-            process_sweep_alignment(ccw_data, -Initial_sweep_speed)
-            return True
-        else:
-            print("CCW Object rejected: Width does not match a can.")
+    
+    if found_ccw and is_it_a_can(ccw_data):
+        process_sweep_alignment(ccw_data, -Initial_sweep_speed)
+        return True
 
-    print("Search failed: No can-sized objects detected.")
     return False
     
 def process_sweep_alignment(data, reverse_speed):
@@ -306,25 +309,26 @@ def set_safe_throttles(r_raw, l_raw, runtime=None):
     # We use a tiny runtime or None to ensure software control
     marc.set_multiple_motor_throttles([r_safe, l_safe, 0], runtime=runtime)
     
+
+
+# 3. Adjust the can acceptance range
+# At >50cm, LiDAR noise can make a 6.6cm can look like 14cm.
 def is_it_a_can(data):
     dists = data["distances"]
-    # 1. How many samples were "on target" (e.g., within 10cm of the minimum)?
-    min_d = min(dists)
-    on_target_samples = [d for d in dists if abs(d - min_d) < 10]
+    if not dists: return False
     
-    # 2. Estimate physical width in cm
-    # (Assuming a 90-degree sweep took 'len(dists)' samples)
+    min_d = min(dists)
+    on_target_samples = [d for d in dists if abs(d - min_d) < 12] # Increased tolerance
+    
+    # Calculate width
     angular_width_per_sample = 90 / len(dists)
     total_angle_radians = math.radians(len(on_target_samples) * angular_width_per_sample)
-    
-    # Chord length formula: Width = 2 * R * sin(theta/2)
     physical_width = 2 * min_d * math.sin(total_angle_radians / 2)
     
-    print(f"Object Analysis: Distance={min_d:.1f}cm, Calc Width={physical_width:.1f}cm")
+    print(f"Object Analysis: Dist={min_d:.1f}cm, Calc Width={physical_width:.1f}cm")
     
-    # A standard soda can is ~6.6cm wide. 
-    # Let's allow a range of 4cm to 12cm to account for noise.
-    if 4 < physical_width < 12:
+    # Updated: 3.5cm to 18cm (Cans look wider further away)
+    if 3.5 < physical_width < 12.0:
         return True
     return False
 
@@ -348,13 +352,18 @@ def approach_optimized(stop_distance=22):
             if (d - last_valid_dist) > BLIP_THRESHOLD:
                 blip_count += 1
                 if blip_count > MAX_BLIPS:
-                    print(f"!!! Target Lost. Last seen at {last_valid_dist:.1f}cm. Recovering...")
+                    print(f"!!! Target Lost at {last_valid_dist:.1f}cm. Initiating Recovery...")
+                    # STOP immediately before recovery
                     set_safe_throttles(0, 0)
-                    time.sleep(0.5)
+                    time.sleep(0.3)
+                    
+                    # Pass the ninety_degree_time (4s) to the recovery sweep
                     recovery_sweep(last_steering_dir, ninety_degree_time, last_valid_dist)
-                    print("Recovery complete. Resuming approach...")
+                    
+                    print("Recovery complete. Re-acquiring target...")
                     blip_count = 0
                     distance_history = []
+                    # Give it 1.5s to see the can again before triggering loss again
                     grace_period_until = time.monotonic() + 1.5
                     continue 
                 continue
@@ -369,22 +378,22 @@ def approach_optimized(stop_distance=22):
 
         current_speed = 0.7
         
-        # Logic for very close range (no gradient math needed)
-        if d < 30:
-            set_safe_throttles(-current_speed, current_speed)
+        # --- 3. CLOSE RANGE STEERING ---
+        # Under 35cm, the gradient math gets messy. We switch to "Direct Aim"
+        if d < 35:
+            # We use a slight CCW bias to keep the can in view of the offset LiDAR
+            set_safe_throttles(-current_speed, current_speed * 1.05, runtime=0)
             continue
 
+        # --- 4. GRADIENT STEERING (Standard Range) ---
         update_buffer(d)
         if len(distance_history) >= BUFFER_SIZE:
             elapsed = time.monotonic() - start_time
             
-            # --- MODIFIED WIGGLE LOGIC ---
-            # If distance > 40cm, calculate wiggle. Else, set to 0.
-            if d > 40:
-                wiggle = math.sin(elapsed * WOBBLE_FREQ * 2 * math.pi) * (0.08 * (d / 100.0))
-            else:
-                wiggle = 0
+            # Wiggle logic for long-range visibility
+            wiggle = math.sin(elapsed * WOBBLE_FREQ * 2 * math.pi) * (0.08 * (d / 100.0)) if d > 45 else 0
             
+            # Calculate how much we are drifting off-course
             net_slope = calculate_gradient(distance_history) - base_gradient
             bias = net_slope * CORRECTION_KP if abs(net_slope) > 0.05 else 0
 
@@ -392,93 +401,100 @@ def approach_optimized(stop_distance=22):
             l_speed = current_speed - last_steering_dir
             r_speed = -(current_speed + last_steering_dir)
             
-            set_safe_throttles(r_speed, l_speed)
+            # Use runtime=0 for smooth, continuous driving
+            set_safe_throttles(r_speed, l_speed, runtime=0)
         else:
-            set_safe_throttles(-current_speed, current_speed)
+            # Initial dash to fill the buffer
+            set_safe_throttles(-current_speed, current_speed, runtime=0)
 
         time.sleep(0.05)
 
 def recovery_sweep(last_dir, ninety_time, expected_dist):
-    """Internal recovery loop. Guaranteed to make a decision."""
-    low, high = expected_dist - 30, expected_dist + 30
+    """
+    If the can disappears, we perform a 360-degree look.
+    Expected_dist helps us ignore the background.
+    """
+    low, high = expected_dist - 25, expected_dist + 25
 
-    while True: # Keep trying until we have data
-        # 1. CW Pass
-        found_cw, cw_data = scan_and_map(speed=-0.8, timeout=ninety_time, low=low, high=high)
-        if found_cw:
-            perform_centering_best_match(cw_data, 0.8, expected_dist)
-            return
+    # 1. Look CW (The 'ninety_time' you set, e.g., 4s)
+    found_cw, cw_data = scan_and_map(speed=-0.8, timeout=ninety_time, low=low, high=high)
+    if found_cw:
+        perform_centering_best_match(cw_data, 0.8, expected_dist)
+        return
 
-        # 2. CCW Pass (180 deg)
-        found_ccw, ccw_data = scan_and_map(speed=0.8, timeout=ninety_time * 1.5, low=low, high=high)
+    # 2. Look CCW (Timeout * 2 to cover the area we just missed + more)
+    found_ccw, ccw_data = scan_and_map(speed=0.8, timeout=ninety_time * 2, low=low, high=high)
+    
+    if ccw_data["distances"]:
+        # We pick the point in the 180-degree scan that is closest to our last known distance
+        perform_centering_best_match(ccw_data, -0.8, expected_dist)
+        return
+    else:
+        # Emergency: If both sweeps see nothing, spin blindly until something appears
+        print("Blind Recovery: Rotating until LiDAR sees an object...")
+        set_safe_throttles(-0.8, 0.8, runtime=0)
+        while scan() > 150: # Rotate until something is closer than 1.5m
+            time.sleep(0.1)
+        set_safe_throttles(0, 0)
         
-        if ccw_data["distances"]:
-            # Even if 'found_ccw' is false (not in window), we pick the best available point
-            perform_centering_best_match(ccw_data, -0.8, expected_dist)
-            return
-        else:
-            print("Total darkness. Blind nudge CCW and retrying sweep...")
-            set_safe_throttles(-0.8, 0.8)
-            time.sleep(0.6)
-            set_safe_throttles(0, 0)
-
 def scan_and_map(speed, timeout, low, high):
     raw_scan_data = []
     log_timestamps = []
     
-    # Gradient tracking for exit detection
+    # Exit tracking
     exit_buffer = []
-    EXIT_WINDOW = 4
-    EXIT_GRADIENT_THRESHOLD = 10.0
-    
+    EXIT_WINDOW = 4 
     can_detected = False
     can_passed = False
     extra_scan_start = None
-    
+
     set_safe_throttles(0, 0)
-    time.sleep(0.5) 
+    time.sleep(0.3) 
     
     start_time = time.monotonic()
     r_val = speed * 1.2 if speed > 0 else speed
     l_val = speed
     
-    set_safe_throttles(r_val, l_val)
+    set_safe_throttles(r_val, l_val, runtime=0)
 
     while (time.monotonic() - start_time) < timeout:
         d = scan()
-        if d is not None and 15 < d < 180:
+        if d is not None and 15 < d < 250:
             curr_relative_time = time.monotonic() - start_time
             raw_scan_data.append(d)
             log_timestamps.append(curr_relative_time)
             
-            # --- Exit Detection Logic ---
+            # --- Early Exit Logic ---
             exit_buffer.append(d)
             if len(exit_buffer) > EXIT_WINDOW:
                 exit_buffer.pop(0)
 
-            # 1. Detect if we are currently looking at the target
+            # 1. Check if we are currently over an object in our "target range"
             if not can_detected and low < d < high:
                 can_detected = True
 
-            # 2. Detect if we have passed the target (Gradient spikes)
+            # 2. Check for the jump (Gradient) to see if we passed the object
             if can_detected and not can_passed and len(exit_buffer) == EXIT_WINDOW:
                 current_grad = calculate_gradient(exit_buffer)
                 if current_grad > EXIT_GRADIENT_THRESHOLD:
-                    print(f"Sweep Exit Detected (Grad: {current_grad:.1f}). Adding padding...")
+                    print(f"Object edge detected (Grad: {current_grad:.1f}). Adding padding...")
                     can_passed = True
                     extra_scan_start = time.monotonic()
 
-        # 3. The 0.5-second "Padding" stop
-        if can_passed and (time.monotonic() - extra_scan_start) > 0.5:
-            print("Padding complete. Stopping sweep.")
+        # 3. Execution of the padding before stopping
+        if can_passed and (time.monotonic() - extra_scan_start) > EXIT_PADDING_TIME:
+            print("Padding complete. Target captured.")
             break
 
         time.sleep(0.01)
 
     set_safe_throttles(0, 0)
+    
+    # Use your improved width check or a simple window check
     found_in_window = any(low < d < high for d in raw_scan_data)
+    
     return found_in_window, {"distances": raw_scan_data, "timestamps": log_timestamps}
-
+    
 def perform_centering_best_match(data, reverse_speed, expected_dist):
     dists = data["distances"]
     times = data["timestamps"]
@@ -510,30 +526,24 @@ def dump_approach_log(log_data):
 
 def locate():
     while True:
-        # Phase 1: Spinning to find the general direction
-        if not initial_locate(5.0):
+        # Phase 1: Using the default ninety_degree_time (4.0s) 
+        # instead of a hardcoded 5.0
+        if not initial_locate(): 
             print("Searching for target...")
             continue
 
         print("Target identified. Handing over to Optimized Approach...")
         
-        # We skip the 'Gap Closer' loop because approach_optimized 
-        # is now smart enough to handle long distances (up to 150cm)
-        # and it won't crash back to Phase 1 if it hits a 'delta' jump.
-        
+        # Start the approach
         status = approach_optimized(stop_distance=15)
 
         if status == "ARRIVED":
             print("MISSION SUCCESS: Target Reached.")
             break
         
-        # Note: In the new version of approach_optimized, 
-        # it will ALMOST NEVER return "LOST". It will just 
-        # loop its own recovery until it finds the can.
         if status == "LOST":
             print("Critical Loss. Restarting full search...")
             continue
-
 def calibrate_base_gradient(duration=3.0):
     print(f"Starting Calibration Sweep ({duration}s)...")
     readings = []
