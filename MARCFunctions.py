@@ -314,7 +314,7 @@ BUFFER_SIZE = 10
 WOBBLE_FREQ = 0.5
 
 # CORRECTION_KP: How aggressively the rover turns back to center.
-CORRECTION_KP = 0.3
+CORRECTION_KP = 0.2
 
 # TUNING: Time to rotate 90 degrees at  search speed (e.g., 0.8)
 ninety_degree_time = 3
@@ -407,7 +407,7 @@ def recovery_sweep(last_dir, ninety_time, expected_dist):
             return
 
         # 2. CCW Pass (180 deg)
-        found_ccw, ccw_data = scan_and_map(speed=0.8, timeout=ninety_time * 2, low=low, high=high)
+        found_ccw, ccw_data = scan_and_map(speed=0.8, timeout=ninety_time * 1.5, low=low, high=high)
         
         if ccw_data["distances"]:
             # Even if 'found_ccw' is false (not in window), we pick the best available point
@@ -566,5 +566,4 @@ def driving_test():
         # SAFETY FIRST: Always ensure motors are OFF when the script ends
         print("Safety Shutdown: Powering down motors.")
         marc.set_multiple_motor_throttles([0, 0, 0], runtime = 1)
-
 
