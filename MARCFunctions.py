@@ -218,85 +218,6 @@ def update_buffer(new_reading):
 
 
 
-
-def initial_locate(timeout=10.0):
-    print("Phase 1: Starting Gradient-Triggered Sweep...")
-    raw_scan_data = []
-    log_timestamps = []
-
-    can_detected = False
-    can_passed = False
-    extra_scan_start = None
-
-    # We'll use a small local window to check the exit gradient
-    exit_buffer = []
-    EXIT_WINDOW = 4
-    # A positive gradient of > 10cm/sample usually means we've hit the background
-    EXIT_GRADIENT_THRESHOLD = 10.0
-
-    uart1.reset_input_buffer()
-    start_time = time.monotonic()
-
-    # Start spinning
-    marc.set_multiple_motor_throttles([1.2*Initial_sweep_speed, Initial_sweep_speed, 0], runtime = 1)
-
-    while (time.monotonic() - start_time) < timeout:
-        d = scan()
-        if d is not None:
-            curr_time = time.monotonic() - start_time
-            raw_scan_data.append(d)
-            log_timestamps.append(curr_time)
-
-            # Update local exit buffer
-            exit_buffer.append(d)
-            if len(exit_buffer) > EXIT_WINDOW:
-                exit_buffer.pop(0)
-
-            # 1. Detect entry (Simple drop in distance)
-            if not can_detected and len(raw_scan_data) > 2:
-                # If distance drops by more than 50cm suddenly, we found 'something'
-                if (raw_scan_data[-2] - d) > 50:
-                    print(f"Target Entered View: {d}cm")
-                    can_detected = True
-
-            # 2. Detect exit (Gradient Analysis)
-            if can_detected and not can_passed and len(exit_buffer) == EXIT_WINDOW:
-                current_grad = calculate_gradient(exit_buffer)
-                if current_grad > EXIT_GRADIENT_THRESHOLD:
-                    print(f"Target Exit Detected (Grad: {current_grad:.1f}). Finishing scan...")
-                    can_passed = True
-                    extra_scan_start = time.monotonic()
-
-        # 3. The 1-second "Padding"
-        if can_passed and (time.monotonic() - extra_scan_start) > 0.5:
-            break
-
-        time.sleep(0.01)
-
-    spin(0) # Emergency stop
-
-    if not can_detected:
-        print("Error: Target never entered field of view.")
-        return False
-
-    # --- Alignment Math ---
-    smoothed = smooth_data(raw_scan_data)
-    mid_index = find_minimum_distance(smoothed)
-
-    actual_duration = log_timestamps[-1]
-    total_samples = len(raw_scan_data)
-    samples_to_reverse = total_samples - mid_index
-    reverse_time = (samples_to_reverse / total_samples) * actual_duration
-
-    print(f"Alignment: Midpoint at index {mid_index}. Reversing {reverse_time:.2f}s")
-
-    marc.set_multiple_motor_throttles([-Initial_sweep_speed, -Initial_sweep_speed, 0], runtime = 1)
-    time.sleep(reverse_time)
-    spin(0)
-
-    return True
-
-
 # --- Fine-Tuned Constants ---
 base_gradient = -0.8369  # Your calibrated value (cm/sample)
 # MAX_PHYSICAL_DELTA: If distance increases by more than 4cm + your speed, it's a wall.
@@ -319,6 +240,64 @@ CORRECTION_KP = 0.2
 # TUNING: Time to rotate 90 degrees at  search speed (e.g., 0.8)
 ninety_degree_time = 3
 
+
+def initial_locate(timeout=ninety_degree_time):
+    print("Phase 1: Starting Multi-Directional Search with Can Validation...")
+    
+    # 1. Try Clockwise Sweep (90 degrees)
+    found_cw, cw_data = scan_and_map(speed=-Initial_sweep_speed, timeout=timeout*1.5, low=20, high=150)
+    if found_cw:
+        # VALIDATION: Check if the object's physical width matches a can
+        if is_it_a_can(cw_data):
+            process_sweep_alignment(cw_data, Initial_sweep_speed)
+            return True
+        else:
+            print("CW Object rejected: Width does not match a can. Continuing search...")
+
+    print("Target not found CW (or rejected). Trying CCW...")
+
+    # 2. Try Counter-Clockwise Sweep (180 degrees+)
+    # We use a larger timeout here to ensure a full 360+ coverage if needed
+    found_ccw, ccw_data = scan_and_map(speed=Initial_sweep_speed, timeout=timeout * 5, low=20, high=150)
+    if found_ccw:
+        # VALIDATION: Check if the object's physical width matches a can
+        if is_it_a_can(ccw_data):
+            process_sweep_alignment(ccw_data, -Initial_sweep_speed)
+            return True
+        else:
+            print("CCW Object rejected: Width does not match a can.")
+
+    print("Search failed: No can-sized objects detected.")
+    return False
+    
+def process_sweep_alignment(data, reverse_speed):
+    """Calculates the midpoint of a sweep and reverses to center on it."""
+    raw_scan_data = data["distances"]
+    log_timestamps = data["timestamps"]
+    
+    if not raw_scan_data:
+        return
+
+    # Use your existing smoothing and min-distance logic
+    smoothed = smooth_data(raw_scan_data)
+    mid_index = find_minimum_distance(smoothed)
+
+    actual_duration = log_timestamps[-1]
+    total_samples = len(raw_scan_data)
+    samples_to_reverse = total_samples - mid_index
+    reverse_time = (samples_to_reverse / total_samples) * actual_duration
+
+    print(f"Alignment: Midpoint at index {mid_index}. Reversing {reverse_time:.2f}s")
+
+    # Reverse at the specified speed (sign depends on which way we were just spinning)
+    # If we were spinning CW (negative speed), reverse_speed should be positive (CCW)
+    r_val = reverse_speed * 1.2 if reverse_speed > 0 else reverse_speed
+    l_val = reverse_speed
+    
+    marc.set_multiple_motor_throttles([r_val, l_val, 0], runtime=1)
+    time.sleep(reverse_time)
+    spin(0)
+
 # --- Safety Helper ---
 def set_safe_throttles(r_raw, l_raw, runtime=None):
     """Caps motor values between -1.0 and 1.0 to prevent system failure."""
@@ -326,6 +305,28 @@ def set_safe_throttles(r_raw, l_raw, runtime=None):
     l_safe = max(-1.0, min(1.0, l_raw))
     # We use a tiny runtime or None to ensure software control
     marc.set_multiple_motor_throttles([r_safe, l_safe, 0], runtime=runtime)
+    
+def is_it_a_can(data):
+    dists = data["distances"]
+    # 1. How many samples were "on target" (e.g., within 10cm of the minimum)?
+    min_d = min(dists)
+    on_target_samples = [d for d in dists if abs(d - min_d) < 10]
+    
+    # 2. Estimate physical width in cm
+    # (Assuming a 90-degree sweep took 'len(dists)' samples)
+    angular_width_per_sample = 90 / len(dists)
+    total_angle_radians = math.radians(len(on_target_samples) * angular_width_per_sample)
+    
+    # Chord length formula: Width = 2 * R * sin(theta/2)
+    physical_width = 2 * min_d * math.sin(total_angle_radians / 2)
+    
+    print(f"Object Analysis: Distance={min_d:.1f}cm, Calc Width={physical_width:.1f}cm")
+    
+    # A standard soda can is ~6.6cm wide. 
+    # Let's allow a range of 4cm to 12cm to account for noise.
+    if 4 < physical_width < 12:
+        return True
+    return False
 
 def approach_optimized(stop_distance=22):
     global distance_history
@@ -348,14 +349,9 @@ def approach_optimized(stop_distance=22):
                 blip_count += 1
                 if blip_count > MAX_BLIPS:
                     print(f"!!! Target Lost. Last seen at {last_valid_dist:.1f}cm. Recovering...")
-                    
-                    # Hard stop before scan
                     set_safe_throttles(0, 0)
                     time.sleep(0.5)
-
-                    # This now handles its own internal looping; never returns to Phase 1
                     recovery_sweep(last_steering_dir, ninety_degree_time, last_valid_dist)
-
                     print("Recovery complete. Resuming approach...")
                     blip_count = 0
                     distance_history = []
@@ -372,15 +368,23 @@ def approach_optimized(stop_distance=22):
             return "ARRIVED"
 
         current_speed = 0.7
+        
+        # Logic for very close range (no gradient math needed)
         if d < 30:
-            # Simple centering for close range
             set_safe_throttles(-current_speed, current_speed)
             continue
 
         update_buffer(d)
         if len(distance_history) >= BUFFER_SIZE:
             elapsed = time.monotonic() - start_time
-            wiggle = math.sin(elapsed * WOBBLE_FREQ * 2 * math.pi) * (0.08 * (d / 100.0))
+            
+            # --- MODIFIED WIGGLE LOGIC ---
+            # If distance > 40cm, calculate wiggle. Else, set to 0.
+            if d > 40:
+                wiggle = math.sin(elapsed * WOBBLE_FREQ * 2 * math.pi) * (0.08 * (d / 100.0))
+            else:
+                wiggle = 0
+            
             net_slope = calculate_gradient(distance_history) - base_gradient
             bias = net_slope * CORRECTION_KP if abs(net_slope) > 0.05 else 0
 
@@ -388,7 +392,6 @@ def approach_optimized(stop_distance=22):
             l_speed = current_speed - last_steering_dir
             r_speed = -(current_speed + last_steering_dir)
             
-            # Use safety cap for calculated speeds
             set_safe_throttles(r_speed, l_speed)
         else:
             set_safe_throttles(-current_speed, current_speed)
@@ -423,6 +426,15 @@ def scan_and_map(speed, timeout, low, high):
     raw_scan_data = []
     log_timestamps = []
     
+    # Gradient tracking for exit detection
+    exit_buffer = []
+    EXIT_WINDOW = 4
+    EXIT_GRADIENT_THRESHOLD = 10.0
+    
+    can_detected = False
+    can_passed = False
+    extra_scan_start = None
+    
     set_safe_throttles(0, 0)
     time.sleep(0.5) 
     
@@ -435,8 +447,32 @@ def scan_and_map(speed, timeout, low, high):
     while (time.monotonic() - start_time) < timeout:
         d = scan()
         if d is not None and 15 < d < 180:
+            curr_relative_time = time.monotonic() - start_time
             raw_scan_data.append(d)
-            log_timestamps.append(time.monotonic() - start_time)
+            log_timestamps.append(curr_relative_time)
+            
+            # --- Exit Detection Logic ---
+            exit_buffer.append(d)
+            if len(exit_buffer) > EXIT_WINDOW:
+                exit_buffer.pop(0)
+
+            # 1. Detect if we are currently looking at the target
+            if not can_detected and low < d < high:
+                can_detected = True
+
+            # 2. Detect if we have passed the target (Gradient spikes)
+            if can_detected and not can_passed and len(exit_buffer) == EXIT_WINDOW:
+                current_grad = calculate_gradient(exit_buffer)
+                if current_grad > EXIT_GRADIENT_THRESHOLD:
+                    print(f"Sweep Exit Detected (Grad: {current_grad:.1f}). Adding padding...")
+                    can_passed = True
+                    extra_scan_start = time.monotonic()
+
+        # 3. The 0.5-second "Padding" stop
+        if can_passed and (time.monotonic() - extra_scan_start) > 0.5:
+            print("Padding complete. Stopping sweep.")
+            break
+
         time.sleep(0.01)
 
     set_safe_throttles(0, 0)
@@ -567,3 +603,19 @@ def driving_test():
         print("Safety Shutdown: Powering down motors.")
         marc.set_multiple_motor_throttles([0, 0, 0], runtime = 1)
 
+def rotation_test(button_obj, speed=0.8): # Add button_obj here
+    """
+    Rotates the rover at a set speed. 
+    Stops immediately when the button on GP14 is pressed.
+    """
+    print("--- ROTATION TEST STARTING ---")
+    print("Spinning... Press the GP14 button to stop.")
+    
+    spin(speed) 
+    
+    # Use the passed-in object
+    while button_obj.value == True:
+        time.sleep(0.01)
+    
+    spin(0)
+    print("--- ROTATION TEST STOPPED BY USER ---")
