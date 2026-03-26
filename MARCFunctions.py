@@ -472,40 +472,45 @@ def approach_optimized(button_obj, stop_distance=22): # 1. Added button_obj
 
 def recovery_sweep(button_obj, last_dir, ninety_time, expected_dist):
     """
-    If the can disappears, we perform a 360-degree look.
-    Expected_dist helps us ignore the background.
+    3-Stage Escalation Recovery:
+    1. 90° CW Sweep (Quick check)
+    2. 180° CCW Sweep (Wide check)
+    3. Full 360° Sweep (Total environment map)
     """
     low, high = expected_dist - 25, expected_dist + 25
 
-    # 1. Look CW - Added button_obj to the call
+    # --- STAGE 1: 90° CW ---
+    print("[RECOVERY] Stage 1: 90° CW Sweep...")
     found_cw, cw_data = scan_and_map(button_obj, speed=-0.8, timeout=ninety_time, low=low, high=high)
     if found_cw:
-        # Added button_obj to the centering call
         perform_centering_best_match(button_obj, cw_data, 0.8, expected_dist)
         return
 
-    # 2. Look CCW - Added button_obj to the call
+    # --- STAGE 2: 180° CCW ---
+    print("[RECOVERY] Stage 2: 180° CCW Sweep...")
+    # timeout * 2 covers the 90 we just did + 90 more
     found_ccw, ccw_data = scan_and_map(button_obj, speed=0.8, timeout=ninety_time * 2, low=low, high=high)
-    
-    if ccw_data["distances"]:
-        # Added button_obj to the centering call
+    if found_ccw:
         perform_centering_best_match(button_obj, ccw_data, -0.8, expected_dist)
         return
+
+    # --- STAGE 3: FULL 360° ---
+    print("[RECOVERY] Stage 3: Target still lost. Performing Full 360°...")
+    # We use force_full_scan=True so it doesn't "Early Exit" after 0.8s
+    _, full_map = scan_and_map(button_obj, speed=-0.8, timeout=ninety_time * 4, 
+                               low=low, high=high, force_full_scan=True)
+    
+    if full_map["distances"]:
+        perform_centering_best_match(button_obj, full_map, 0.8, expected_dist)
     else:
-        # Emergency: Added check_abort so you can stop the blind spin
-        print("Blind Recovery: Rotating until LiDAR sees an object...")
-        set_safe_throttles(-0.8, 0.8, runtime=0)
-        while True:
-            check_abort(button_obj) # Hand off button here
-            d = scan()
-            if d is not None and d < 150:
-                break
-            time.sleep(0.1)
-        set_safe_throttles(0, 0)
+        print("!!! All recovery stages failed. Entering Blind Rotation.")
+        # ... (Blind rotation logic)
         
-def scan_and_map(button_obj, speed, timeout, low, high): # 1. Added button_obj
+        
+def scan_and_map(button_obj, speed, timeout, low, high, force_full_scan=False):
     raw_scan_data = []
     log_timestamps = []
+    stall_buffer = [] # For stall detection
     
     exit_buffer = []
     EXIT_WINDOW = 4 
@@ -513,61 +518,54 @@ def scan_and_map(button_obj, speed, timeout, low, high): # 1. Added button_obj
     can_passed = False
     extra_scan_start = None
 
-    # 1. Safety stop before starting
     set_safe_throttles(0, 0)
+    time.sleep(0.2)
     
-    # Abort-aware initial pause
-    pause_start = time.monotonic()
-    while time.monotonic() - pause_start < 0.3:
-        # 2. Pass button_obj to the checker
-        check_abort(button_obj) 
-        time.sleep(0.01)
-    
-    # 2. Start Rotation
     start_time = time.monotonic()
     set_safe_throttles(speed * 1.2 if speed > 0 else speed, speed, runtime=0)
 
-    # 3. Main Scanning Loop
     while (time.monotonic() - start_time) < timeout:
-        # 3. Pass button_obj to the checker here too
-        check_abort(button_obj) 
+        check_abort(button_obj)
         
         d = scan()
-        if d is not None and 15 < d < 250:
-            curr_relative_time = time.monotonic() - start_time
+        if d is not None:
+            curr_time = time.monotonic()
             raw_scan_data.append(d)
-            log_timestamps.append(curr_relative_time)
+            log_timestamps.append(curr_time - start_time)
             
-            # --- Early Exit Logic ---
-            exit_buffer.append(d)
-            if len(exit_buffer) > EXIT_WINDOW: 
-                exit_buffer.pop(0)
+            # --- 1. STALL CHECK ---
+            stall_buffer.append((curr_time, d))
+            stall_buffer = [log for log in stall_buffer if curr_time - log[0] <= 2.0]
+            if len(stall_buffer) > 10:
+                dists = [log[1] for log in stall_buffer]
+                if (max(dists) - min(dists)) < 1.0: # Variance < 1cm
+                    set_safe_throttles(0, 0)
+                    raise AbortTestException("Motor Stall detected during sweep")
 
-            if not can_detected and low < d < high:
-                can_detected = True
+            # --- 2. EARLY EXIT LOGIC (0.8s Buffer) ---
+            if not force_full_scan and 15 < d < 250:
+                exit_buffer.append(d)
+                if len(exit_buffer) > EXIT_WINDOW: exit_buffer.pop(0)
 
-            if can_detected and not can_passed and len(exit_buffer) == EXIT_WINDOW:
-                if calculate_gradient(exit_buffer) > EXIT_GRADIENT_THRESHOLD:
-                    can_passed = True
-                    extra_scan_start = time.monotonic()
+                if not can_detected and low < d < high:
+                    can_detected = True
 
-        # 4. Exit Padding Execution
-        if can_passed and (time.monotonic() - extra_scan_start) > EXIT_PADDING_TIME:
-            break
+                if can_detected and not can_passed and len(exit_buffer) == EXIT_WINDOW:
+                    if calculate_gradient(exit_buffer) > EXIT_GRADIENT_THRESHOLD:
+                        can_passed = True
+                        extra_scan_start = time.monotonic()
+
+        if not force_full_scan and can_passed:
+            if (time.monotonic() - extra_scan_start) > EXIT_PADDING_TIME:
+                break
 
         time.sleep(0.01)
 
-    # 5. Cleanup and Data Packaging
-    end_time = time.monotonic()
-    actual_duration = end_time - start_time
     set_safe_throttles(0, 0)
-    
-    found_in_window = any(low < d < high for d in raw_scan_data)
-    
-    return found_in_window, {
+    return any(low < d < high for d in raw_scan_data), {
         "distances": raw_scan_data, 
         "timestamps": log_timestamps, 
-        "duration": actual_duration
+        "duration": time.monotonic() - start_time
     }
     
 def perform_centering_best_match(button_obj, data, reverse_speed, expected_dist): # 1. Added button_obj
