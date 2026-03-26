@@ -25,8 +25,19 @@ marc = MARC(
 )
 uart1 = busio.UART(board.GP4, board.GP5, baudrate=115200)
 
+import board
+import digitalio
+import time
+import supervisor
+
+# Define a custom exception for a clean "bail out"
+class AbortTestException(Exception):
+    pass
 
 
+def check_abort(button_obj): # Accept the object here
+    if not button_obj.value: 
+        raise AbortTestException("Manual Abort Triggered")
 
 
 #servo functions
@@ -235,7 +246,7 @@ BUFFER_SIZE = 10
 WOBBLE_FREQ = 0.5
 
 # CORRECTION_KP: How aggressively the rover turns back to center.
-CORRECTION_KP = 0.2
+CORRECTION_KP = 0.01
 
 # TUNING: Time to rotate 90 degrees at  search speed (e.g., 0.8)
 ninety_degree_time = 4
@@ -251,56 +262,70 @@ EXIT_GRADIENT_THRESHOLD = 25.0
 EXIT_PADDING_TIME = 0.8 
 
 
-def initial_locate(timeout=None):
-    if timeout is None:
-        timeout = ninety_degree_time # 4 seconds
+def initial_locate(button_obj, timeout=None): # 1. Added button_obj here
+    if timeout is None: 
+        timeout = ninety_degree_time
 
-    # 1. Quick CW Sweep (Usually 4s or until padding)
-    print(f"Phase 1: Starting CW Search (Max: {timeout}s)")
-    found_cw, cw_data = scan_and_map(speed=-Initial_sweep_speed, timeout=timeout, low=20, high=150)
+    # 1. Clockwise Sweep
+    # 2. Pass button_obj to scan_and_map
+    found_cw, cw_data = scan_and_map(button_obj, speed=-Initial_sweep_speed, timeout=timeout, low=20, high=150)
+    print(f"[TIME] CW Sweep took {cw_data['duration']:.2f}s (Max: {timeout}s)")
     
     if found_cw and is_it_a_can(cw_data):
-        process_sweep_alignment(cw_data, Initial_sweep_speed)
+        # 3. Pass button_obj to process_sweep_alignment
+        process_sweep_alignment(button_obj, cw_data, Initial_sweep_speed)
         return True
 
-    # 2. Deep CCW Sweep (Max 20s, but will likely exit in ~6-8s if it finds the can)
+    # 2. Counter-Clockwise Sweep
     print("Target not found CW. Trying CCW Full Sweep...")
-    found_ccw, ccw_data = scan_and_map(speed=Initial_sweep_speed, timeout=timeout * 5, low=20, high=150)
+    # 4. Pass button_obj to scan_and_map again
+    found_ccw, ccw_data = scan_and_map(button_obj, speed=Initial_sweep_speed, timeout=timeout * 5, low=20, high=150)
+    print(f"[TIME] CCW Sweep took {ccw_data['duration']:.2f}s (Max: {timeout * 5}s)")
     
     if found_ccw and is_it_a_can(ccw_data):
-        process_sweep_alignment(ccw_data, -Initial_sweep_speed)
+        # 5. Pass button_obj to process_sweep_alignment again
+        process_sweep_alignment(button_obj, cw_data, -Initial_sweep_speed)
         return True
 
     return False
     
-def process_sweep_alignment(data, reverse_speed):
-    """Calculates the midpoint of a sweep and reverses to center on it."""
+def process_sweep_alignment(button_obj, data, reverse_speed): # 1. Added button_obj
     raw_scan_data = data["distances"]
     log_timestamps = data["timestamps"]
+    actual_duration = data["duration"]
     
-    if not raw_scan_data:
+    if not raw_scan_data: 
         return
 
-    # Use your existing smoothing and min-distance logic
     smoothed = smooth_data(raw_scan_data)
     mid_index = find_minimum_distance(smoothed)
 
-    actual_duration = log_timestamps[-1]
     total_samples = len(raw_scan_data)
     samples_to_reverse = total_samples - mid_index
+    
+    # Calculate reverse time based on the actual duration of the movement
     reverse_time = (samples_to_reverse / total_samples) * actual_duration
 
-    print(f"Alignment: Midpoint at index {mid_index}. Reversing {reverse_time:.2f}s")
+    print(f"[TIME] Alignment: Sweep lasted {actual_duration:.2f}s. Reversing {reverse_time:.2f}s to midpoint.")
 
-    # Reverse at the specified speed (sign depends on which way we were just spinning)
-    # If we were spinning CW (negative speed), reverse_speed should be positive (CCW)
     r_val = reverse_speed * 1.2 if reverse_speed > 0 else reverse_speed
     l_val = reverse_speed
     
-    marc.set_multiple_motor_throttles([r_val, l_val, 0], runtime=1)
-    time.sleep(reverse_time)
-    spin(0)
+    # 1. Start the motors
+    set_safe_throttles(r_val, l_val, runtime=2) 
 
+    # 2. Abort-aware reverse loop
+    start_reverse_time = time.monotonic()
+    while (time.monotonic() - start_reverse_time) < reverse_time:
+        # 2. check_abort now has access to the button_obj passed in above
+        check_abort(button_obj)  
+        time.sleep(0.01) 
+
+    # 3. Stop the motors
+    set_safe_throttles(0, 0)
+    print("[DONE] Midpoint alignment reached.")
+    
+    
 # --- Safety Helper ---
 def set_safe_throttles(r_raw, l_raw, runtime=None):
     """Caps motor values between -1.0 and 1.0 to prevent system failure."""
@@ -332,9 +357,15 @@ def is_it_a_can(data):
         return True
     return False
 
-def approach_optimized(stop_distance=22):
+def approach_optimized(button_obj, stop_distance=22): # 1. Added button_obj
     global distance_history
     distance_history = []
+    
+    # Stall Detection Variables
+    stall_history = [] 
+    STALL_TIME_THRESHOLD = 3.0
+    STALL_VARIANCE_THRESHOLD = 1.5 
+    
     last_valid_dist = None
     blip_count = 0
     start_time = time.monotonic()
@@ -342,28 +373,70 @@ def approach_optimized(stop_distance=22):
     grace_period_until = 0
 
     while True:
+        check_abort(button_obj) # 2. Added button_obj here
+        
         d = scan()
         if d is None: continue
         
         curr_time = time.monotonic()
         
-        # --- 1. TARGET LOSS & RECOVERY ---
+        # --- 1. STALL DETECTION ---
+        stall_history.append((curr_time, d))
+        stall_history = [log for log in stall_history if curr_time - log[0] <= 3.5]
+        
+        if len(stall_history) > 10:
+            first_log = stall_history[0]
+            if (curr_time - first_log[0]) >= STALL_TIME_THRESHOLD:
+                recent_dists = [log[1] for log in stall_history]
+                dist_range = max(recent_dists) - min(recent_dists)
+                
+                if dist_range < STALL_VARIANCE_THRESHOLD:
+                    print(f"!!! STALL DETECTED: Distance stuck at {d:.1f}cm.")
+                    
+                    set_safe_throttles(0, 0)
+                    # Abort-aware 0.2s pause
+                    t_pause = time.monotonic()
+                    while time.monotonic() - t_pause < 0.2:
+                        check_abort(button_obj) # 3. Added button_obj
+                        time.sleep(0.01)
+
+                    print("Backing away from obstacle...")
+                    set_safe_throttles(0.8, -0.8, runtime=1.2) 
+                    
+                    # Abort-aware 1.2s reverse
+                    t_rev = time.monotonic()
+                    while time.monotonic() - t_rev < 1.2:
+                        check_abort(button_obj) # 4. Added button_obj
+                        time.sleep(0.01)
+                        
+                    set_safe_throttles(0, 0)
+                    # 5. Added button_obj to recovery_sweep
+                    recovery_sweep(button_obj, last_steering_dir, ninety_degree_time, d + 20)
+                    
+                    stall_history = []
+                    distance_history = []
+                    grace_period_until = time.monotonic() + 1.5
+                    continue
+
+        # --- 2. TARGET LOSS & RECOVERY ---
         if last_valid_dist is not None and curr_time > grace_period_until:
             if (d - last_valid_dist) > BLIP_THRESHOLD:
                 blip_count += 1
                 if blip_count > MAX_BLIPS:
-                    print(f"!!! Target Lost at {last_valid_dist:.1f}cm. Initiating Recovery...")
-                    # STOP immediately before recovery
+                    print(f"!!! Target Lost. Recovering...")
                     set_safe_throttles(0, 0)
-                    time.sleep(0.3)
                     
-                    # Pass the ninety_degree_time (4s) to the recovery sweep
-                    recovery_sweep(last_steering_dir, ninety_degree_time, last_valid_dist)
-                    
-                    print("Recovery complete. Re-acquiring target...")
+                    # Abort-aware 0.3s pause
+                    t_pause = time.monotonic()
+                    while time.monotonic() - t_pause < 0.3:
+                        check_abort(button_obj) # 6. Added button_obj
+                        time.sleep(0.01)
+                        
+                    # 7. Added button_obj to recovery_sweep
+                    recovery_sweep(button_obj, last_steering_dir, ninety_degree_time, last_valid_dist)
                     blip_count = 0
                     distance_history = []
-                    # Give it 1.5s to see the can again before triggering loss again
+                    stall_history = []
                     grace_period_until = time.monotonic() + 1.5
                     continue 
                 continue
@@ -371,93 +444,94 @@ def approach_optimized(stop_distance=22):
         blip_count = 0
         last_valid_dist = d 
         
-        # --- 2. ARRIVAL & CONTROL ---
+        # --- 3. ARRIVAL & CONTROL ---
         if d <= stop_distance:
             set_safe_throttles(0, 0)
             return "ARRIVED"
 
         current_speed = 0.7
         
-        # --- 3. CLOSE RANGE STEERING ---
-        # Under 35cm, the gradient math gets messy. We switch to "Direct Aim"
         if d < 35:
-            # We use a slight CCW bias to keep the can in view of the offset LiDAR
             set_safe_throttles(-current_speed, current_speed * 1.05, runtime=0)
-            continue
-
-        # --- 4. GRADIENT STEERING (Standard Range) ---
-        update_buffer(d)
-        if len(distance_history) >= BUFFER_SIZE:
-            elapsed = time.monotonic() - start_time
-            
-            # Wiggle logic for long-range visibility
-            wiggle = math.sin(elapsed * WOBBLE_FREQ * 2 * math.pi) * (0.08 * (d / 100.0)) if d > 45 else 0
-            
-            # Calculate how much we are drifting off-course
-            net_slope = calculate_gradient(distance_history) - base_gradient
-            bias = net_slope * CORRECTION_KP if abs(net_slope) > 0.05 else 0
-
-            last_steering_dir = wiggle + bias
-            l_speed = current_speed - last_steering_dir
-            r_speed = -(current_speed + last_steering_dir)
-            
-            # Use runtime=0 for smooth, continuous driving
-            set_safe_throttles(r_speed, l_speed, runtime=0)
         else:
-            # Initial dash to fill the buffer
-            set_safe_throttles(-current_speed, current_speed, runtime=0)
+            update_buffer(d)
+            if len(distance_history) >= BUFFER_SIZE:
+                elapsed = curr_time - start_time
+                wiggle = math.sin(elapsed * WOBBLE_FREQ * 2 * math.pi) * (0.08 * (d / 100.0)) if d > 45 else 0
+                net_slope = calculate_gradient(distance_history) - base_gradient
+                bias = net_slope * CORRECTION_KP if abs(net_slope) > 0.05 else 0
+
+                last_steering_dir = wiggle + bias
+                l_speed = current_speed - last_steering_dir
+                r_speed = -(current_speed + last_steering_dir)
+                set_safe_throttles(r_speed, l_speed, runtime=0)
+            else:
+                set_safe_throttles(-current_speed, current_speed, runtime=0)
 
         time.sleep(0.05)
 
-def recovery_sweep(last_dir, ninety_time, expected_dist):
+def recovery_sweep(button_obj, last_dir, ninety_time, expected_dist):
     """
     If the can disappears, we perform a 360-degree look.
     Expected_dist helps us ignore the background.
     """
     low, high = expected_dist - 25, expected_dist + 25
 
-    # 1. Look CW (The 'ninety_time' you set, e.g., 4s)
-    found_cw, cw_data = scan_and_map(speed=-0.8, timeout=ninety_time, low=low, high=high)
+    # 1. Look CW - Added button_obj to the call
+    found_cw, cw_data = scan_and_map(button_obj, speed=-0.8, timeout=ninety_time, low=low, high=high)
     if found_cw:
-        perform_centering_best_match(cw_data, 0.8, expected_dist)
+        # Added button_obj to the centering call
+        perform_centering_best_match(button_obj, cw_data, 0.8, expected_dist)
         return
 
-    # 2. Look CCW (Timeout * 2 to cover the area we just missed + more)
-    found_ccw, ccw_data = scan_and_map(speed=0.8, timeout=ninety_time * 2, low=low, high=high)
+    # 2. Look CCW - Added button_obj to the call
+    found_ccw, ccw_data = scan_and_map(button_obj, speed=0.8, timeout=ninety_time * 2, low=low, high=high)
     
     if ccw_data["distances"]:
-        # We pick the point in the 180-degree scan that is closest to our last known distance
-        perform_centering_best_match(ccw_data, -0.8, expected_dist)
+        # Added button_obj to the centering call
+        perform_centering_best_match(button_obj, ccw_data, -0.8, expected_dist)
         return
     else:
-        # Emergency: If both sweeps see nothing, spin blindly until something appears
+        # Emergency: Added check_abort so you can stop the blind spin
         print("Blind Recovery: Rotating until LiDAR sees an object...")
         set_safe_throttles(-0.8, 0.8, runtime=0)
-        while scan() > 150: # Rotate until something is closer than 1.5m
+        while True:
+            check_abort(button_obj) # Hand off button here
+            d = scan()
+            if d is not None and d < 150:
+                break
             time.sleep(0.1)
         set_safe_throttles(0, 0)
         
-def scan_and_map(speed, timeout, low, high):
+def scan_and_map(button_obj, speed, timeout, low, high): # 1. Added button_obj
     raw_scan_data = []
     log_timestamps = []
     
-    # Exit tracking
     exit_buffer = []
     EXIT_WINDOW = 4 
     can_detected = False
     can_passed = False
     extra_scan_start = None
 
+    # 1. Safety stop before starting
     set_safe_throttles(0, 0)
-    time.sleep(0.3) 
     
+    # Abort-aware initial pause
+    pause_start = time.monotonic()
+    while time.monotonic() - pause_start < 0.3:
+        # 2. Pass button_obj to the checker
+        check_abort(button_obj) 
+        time.sleep(0.01)
+    
+    # 2. Start Rotation
     start_time = time.monotonic()
-    r_val = speed * 1.2 if speed > 0 else speed
-    l_val = speed
-    
-    set_safe_throttles(r_val, l_val, runtime=0)
+    set_safe_throttles(speed * 1.2 if speed > 0 else speed, speed, runtime=0)
 
+    # 3. Main Scanning Loop
     while (time.monotonic() - start_time) < timeout:
+        # 3. Pass button_obj to the checker here too
+        check_abort(button_obj) 
+        
         d = scan()
         if d is not None and 15 < d < 250:
             curr_relative_time = time.monotonic() - start_time
@@ -466,39 +540,43 @@ def scan_and_map(speed, timeout, low, high):
             
             # --- Early Exit Logic ---
             exit_buffer.append(d)
-            if len(exit_buffer) > EXIT_WINDOW:
+            if len(exit_buffer) > EXIT_WINDOW: 
                 exit_buffer.pop(0)
 
-            # 1. Check if we are currently over an object in our "target range"
             if not can_detected and low < d < high:
                 can_detected = True
 
-            # 2. Check for the jump (Gradient) to see if we passed the object
             if can_detected and not can_passed and len(exit_buffer) == EXIT_WINDOW:
-                current_grad = calculate_gradient(exit_buffer)
-                if current_grad > EXIT_GRADIENT_THRESHOLD:
-                    print(f"Object edge detected (Grad: {current_grad:.1f}). Adding padding...")
+                if calculate_gradient(exit_buffer) > EXIT_GRADIENT_THRESHOLD:
                     can_passed = True
                     extra_scan_start = time.monotonic()
 
-        # 3. Execution of the padding before stopping
+        # 4. Exit Padding Execution
         if can_passed and (time.monotonic() - extra_scan_start) > EXIT_PADDING_TIME:
-            print("Padding complete. Target captured.")
             break
 
         time.sleep(0.01)
 
+    # 5. Cleanup and Data Packaging
+    end_time = time.monotonic()
+    actual_duration = end_time - start_time
     set_safe_throttles(0, 0)
     
-    # Use your improved width check or a simple window check
     found_in_window = any(low < d < high for d in raw_scan_data)
     
-    return found_in_window, {"distances": raw_scan_data, "timestamps": log_timestamps}
+    return found_in_window, {
+        "distances": raw_scan_data, 
+        "timestamps": log_timestamps, 
+        "duration": actual_duration
+    }
     
-def perform_centering_best_match(data, reverse_speed, expected_dist):
+def perform_centering_best_match(button_obj, data, reverse_speed, expected_dist): # 1. Added button_obj
     dists = data["distances"]
     times = data["timestamps"]
     
+    if not dists:
+        return
+
     # Mathematical 'Best Match' calculation
     best_idx = min(range(len(dists)), key=lambda i: abs(dists[i] - expected_dist))
     
@@ -511,10 +589,18 @@ def perform_centering_best_match(data, reverse_speed, expected_dist):
     r_val = reverse_speed * 1.2 if reverse_speed > 0 else reverse_speed
     l_val = reverse_speed
     
-    # Reverse to target
+    # 2. Start the motors
     set_safe_throttles(r_val, l_val)
-    time.sleep(reverse_time)
+
+    # 3. Abort-aware reverse (replacing time.sleep)
+    start_centering = time.monotonic()
+    while (time.monotonic() - start_centering) < reverse_time:
+        check_abort(button_obj) # 4. The final baton pass!
+        time.sleep(0.01)
+
+    # 4. Stop the motors
     set_safe_throttles(0, 0)
+    print("[DONE] Centered on best match.")
     
 def dump_approach_log(log_data):
     print("\n--- APPROACH DATA LOG ---")
@@ -524,18 +610,18 @@ def dump_approach_log(log_data):
         print(f"{entry[0]:.2f}     | {entry[1]:.1f}      | {entry[2]}")
     print("-" * 35)
 
-def locate():
+def locate(button_obj): # 1. Added button_obj here
     while True:
-        # Phase 1: Using the default ninety_degree_time (4.0s) 
-        # instead of a hardcoded 5.0
-        if not initial_locate(): 
+        # 2. Pass button_obj to initial_locate
+        if not initial_locate(button_obj): 
             print("Searching for target...")
+            time.sleep(0.1) # Small delay to keep CPU sane
             continue
 
         print("Target identified. Handing over to Optimized Approach...")
         
-        # Start the approach
-        status = approach_optimized(stop_distance=15)
+        # 3. Pass button_obj to approach_optimized
+        status = approach_optimized(button_obj, stop_distance=15)
 
         if status == "ARRIVED":
             print("MISSION SUCCESS: Target Reached.")
@@ -544,6 +630,7 @@ def locate():
         if status == "LOST":
             print("Critical Loss. Restarting full search...")
             continue
+            
 def calibrate_base_gradient(duration=3.0):
     print(f"Starting Calibration Sweep ({duration}s)...")
     readings = []
@@ -588,31 +675,48 @@ def calibrate_base_gradient(duration=3.0):
 
 # To run it:
 # my_data = calibrate_with_data_dump(3.0)
-
-def driving_test():
+def driving_test(button_obj): # 1. Added button_obj here
     print("--- Rover Target Acquisition Test ---")
     print(f"Parameters: Base Speed: {forward_drive_speed}, Sweep Speed: {Initial_sweep_speed}")
     print(f"Base Gradient: {base_gradient}, Max Physical Delta: {MAX_PHYSICAL_DELTA}")
 
-    # Wait for user to place the rover and clear the area
-    print("System ready. Starting in 3 seconds... (Press Ctrl+C to abort)")
-    time.sleep(3)
+    # 1. Abort-aware countdown
+    print("System ready. Starting in 3 seconds... (Press Button or Ctrl+C to abort)")
+    countdown_start = time.monotonic()
+    while time.monotonic() - countdown_start < 3.0:
+        # 2. Pass button_obj to the check_abort function
+        check_abort(button_obj) 
+        time.sleep(0.1)
 
     try:
-        # Start the State Machine
-        locate()
+        # 2. Start the State Machine
+        # 3. Pass button_obj to the locate() function
+        locate(button_obj)
+        time.sleep(1)
+        runDump("up")
+        time.sleep(1)
+        forward(0.7)
+        time.sleep(1)
+        forward(0)
+        time.sleep(5)
+        runDump("down")
 
         print("\n[SUCCESS] Rover reached the stop distance.")
 
-    except KeyboardInterrupt:
-        print("\n[ABORTED] User interrupted the test.")
-    except Exception as e:
-        print(f"\n[ERROR] System Failure: {e}")
-    finally:
-        # SAFETY FIRST: Always ensure motors are OFF when the script ends
-        print("Safety Shutdown: Powering down motors.")
-        marc.set_multiple_motor_throttles([0, 0, 0], runtime = 1)
+    except (KeyboardInterrupt, AbortTestException) as stop_signal:
+        # Handle both physical button and Ctrl+C
+        print(f"\n[ABORTED] Test stopped by user: {stop_signal}")
 
+    except Exception as e:
+        # Handle unexpected code crashes
+        print(f"\n[ERROR] System Failure: {e}")
+        # Optional: traceback.print_exception(e) if you imported it
+        
+    finally:
+        # 3. SAFETY FIRST: This block ALWAYS runs, even if there's a crash
+        print("Safety Shutdown: Powering down motors.")
+        # Ensure hard stop
+        set_safe_throttles(0, 0, runtime=1)
 def rotation_test(button_obj, speed=0.8): # Add button_obj here
     """
     Rotates the rover at a set speed. 
@@ -628,4 +732,21 @@ def rotation_test(button_obj, speed=0.8): # Add button_obj here
         time.sleep(0.01)
     
     spin(0)
-    print("--- ROTATION TEST STOPPED BY USER ---")
+    print("--- FORWARD TEST STOPPED BY USER ---")
+    
+def forward_test(button_obj, speed): # Add button_obj here
+    """
+    Rotates the rover at a set speed. 
+    Stops immediately when the button on GP14 is pressed.
+    """
+    print("--- FORWARD TEST STARTING ---")
+    print("Spinning... Press the GP14 button to stop.")
+    
+    marc.set_multiple_motor_throttles([-0.5, 1, 0], runtime = 1)
+    
+    # Use the passed-in object
+    while button_obj.value == True:
+        time.sleep(0.01)
+    
+    spin(0)
+    print("--- FORWARD TEST STOPPED BY USER ---")
