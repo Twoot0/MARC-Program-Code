@@ -473,9 +473,9 @@ def approach_optimized(button_obj, stop_distance=22): # 1. Added button_obj
 def recovery_sweep(button_obj, last_dir, ninety_time, expected_dist):
     """
     3-Stage Escalation Recovery:
-    1. 90° CW Sweep (Quick check)
-    2. 180° CCW Sweep (Wide check)
-    3. Full 360° Sweep (Total environment map)
+    1. 90° CW Sweep
+    2. 180° CCW Sweep
+    3. Full 360° Sweep + Dead-Zone Reverse
     """
     low, high = expected_dist - 25, expected_dist + 25
 
@@ -488,24 +488,26 @@ def recovery_sweep(button_obj, last_dir, ninety_time, expected_dist):
 
     # --- STAGE 2: 180° CCW ---
     print("[RECOVERY] Stage 2: 180° CCW Sweep...")
-    # timeout * 2 covers the 90 we just did + 90 more
+    # timeout * 2 covers the 90 we just did + 90 more to make it 180 total
     found_ccw, ccw_data = scan_and_map(button_obj, speed=0.8, timeout=ninety_time * 2, low=low, high=high)
     if found_ccw:
         perform_centering_best_match(button_obj, ccw_data, -0.8, expected_dist)
         return
 
     # --- STAGE 3: FULL 360° ---
-    print("[RECOVERY] Stage 3: Target still lost. Performing Full 360°...")
-    # We use force_full_scan=True so it doesn't "Early Exit" after 0.8s
-    _, full_map = scan_and_map(button_obj, speed=-0.8, timeout=ninety_time * 4, 
+    print("[RECOVERY] Stage 3: Performing Full 360°...")
+    _, full_map = scan_and_map(button_obj, speed=-0.67, timeout=ninety_time * 4, 
                                low=low, high=high, force_full_scan=True)
     
-    if full_map["distances"]:
+    dists = full_map["distances"]
+    if dists:
+        variance = max(dists) - min(dists)
+        if variance < 10.0: 
+            print(f"!!! DEAD ZONE: Constant distance ({min(dists):.1f}cm).")
+            # ... (your reverse logic here)
+            return 
+
         perform_centering_best_match(button_obj, full_map, 0.8, expected_dist)
-    else:
-        print("!!! All recovery stages failed. Entering Blind Rotation.")
-        # ... (Blind rotation logic)
-        
         
 def scan_and_map(button_obj, speed, timeout, low, high, force_full_scan=False):
     raw_scan_data = []
